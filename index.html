@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rhinovirus 3Dpol MD Simulation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a1a;
+            color: #fff;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        #app {
+            display: flex;
+            height: 100vh;
+        }
+
+        #canvas {
+            flex: 1;
+            background: linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 100%);
+        }
+
+        .sidebar {
+            width: 350px;
+            background: #2a2a2a;
+            border-left: 1px solid #444;
+            padding: 20px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .panel {
+            background: #333;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #444;
+        }
+
+        .panel h3 {
+            margin-bottom: 10px;
+            font-size: 14px;
+            color: #aaa;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        input, select {
+            width: 100%;
+            padding: 8px;
+            margin-bottom: 8px;
+            background: #1a1a1a;
+            border: 1px solid #444;
+            color: #fff;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        button {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 8px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .info {
+            background: #1a1a1a;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            line-height: 1.6;
+            color: #aaa;
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 0;
+        }
+
+        .info-label {
+            font-weight: 600;
+            color: #999;
+        }
+
+        .info-value {
+            color: #667eea;
+            font-family: 'Courier New', monospace;
+        }
+
+        .status {
+            background: #1a1a1a;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            border-left: 3px solid #667eea;
+            color: #aaa;
+        }
+
+        .status.error {
+            border-left-color: #ff6b6b;
+            color: #ff6b6b;
+        }
+
+        .status.success {
+            border-left-color: #51cf66;
+            color: #51cf66;
+        }
+
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #2a2a2a;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #667eea;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #764ba2;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div id="canvas"></div>
+
+        <div class="sidebar">
+            <!-- Structure Loading -->
+            <div class="panel">
+                <h3>Structure</h3>
+                <input type="text" id="pdbId" placeholder="PDB ID (e.g., 1XR5)" value="1XR5">
+                <button id="loadBtn">Load PDB</button>
+                <div id="loadStatus" class="status" style="display:none;"></div>
+            </div>
+
+            <!-- Inhibitor -->
+            <div class="panel">
+                <h3>Inhibitor</h3>
+                <select id="inhibitorType">
+                    <option value="nucleoside">Nucleoside Analog</option>
+                    <option value="protease">Protease Inhibitor</option>
+                    <option value="allosteric">Allosteric Inhibitor</option>
+                    <option value="generic">Generic Molecule</option>
+                </select>
+                <button id="addInhibitorBtn">Add Inhibitor</button>
+            </div>
+
+            <!-- Simulation -->
+            <div class="panel">
+                <h3>Simulation</h3>
+                <button id="startBtn">Start</button>
+                <button id="pauseBtn" disabled>Pause</button>
+                <button id="resetBtn">Reset</button>
+                <div class="info">
+                    <div class="info-row">
+                        <span class="info-label">Time:</span>
+                        <span class="info-value" id="simTime">0.00 ps</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Step:</span>
+                        <span class="info-value" id="stepCount">0</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Temp:</span>
+                        <span class="info-value" id="tempValue">300 K</span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Energy:</span>
+                        <span class="info-value" id="energyValue">0.00</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Visualization -->
+            <div class="panel">
+                <h3>Visualization</h3>
+                <select id="viewMode">
+                    <option value="ball-and-stick">Ball & Stick</option>
+                    <option value="space-fill">Space Fill</option>
+                    <option value="cartoon">Cartoon</option>
+                </select>
+                <button id="resetCameraBtn">Reset View</button>
+                <button id="zoomFitBtn">Zoom to Fit</button>
+            </div>
+
+            <!-- Analysis -->
+            <div class="panel">
+                <h3>Analysis</h3>
+                <button id="analyzeBtn">Analyze Binding</button>
+                <div id="bindingResult" class="info" style="display:none;"></div>
+            </div>
+
+            <!-- Export -->
+            <div class="panel">
+                <h3>Export</h3>
+                <button id="exportJsonBtn">JSON</button>
+                <button id="exportCsvBtn">CSV</button>
+                <button id="exportPdbBtn">PDB</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Resolve the bare "three" specifier used inside the modules to the
+         vendored copy, so no CDN / bundler / npm install is needed. -->
+    <script type="importmap">
+    { "imports": { "three": "./three.module.js" } }
+    </script>
+
+    <script type="module" src="index.js"></script>
+</body>
+</html>
