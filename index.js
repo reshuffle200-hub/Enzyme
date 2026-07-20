@@ -10,7 +10,8 @@
  * CHANGES vs. the original controller:
  * - The 3D view now plays back the simulation as a recorded trajectory:
  *   each completed physics step is streamed into the visualization engine's
- *   playback buffer (see onPhysicsStep + Start/Pause/Reset handlers).
+ *   trajectory up front, then plays it back smoothly (see captureTrajectory
+ *   + Start/Pause/Reset handlers).
  * - Hydrophobic contacts are drawn in addition to H-bonds/electrostatics.
  * - All visualization calls use the method names the engine now exposes.
  */
@@ -99,6 +100,10 @@ loadBtn.addEventListener('click', async () => {
       appState.pdbFetcher.pdbCache[pdbId] = structure;
     }
     appState.structure = structure;
+    // Remember the crystal pose so every capture starts fresh from it.
+    appState.initialPositions = appState.structure.atoms.map((a) => ({
+      x: a.position.x, y: a.position.y, z: a.position.z,
+    }));
 
     // 3) Build the 3D scene (70–90%)
     setProgress(72, 'Building 3D scene…');
@@ -113,10 +118,8 @@ loadBtn.addEventListener('click', async () => {
     appState.physics = new PhysicsEngine(appState.structure, {
       temperature: 300,
       timestep: 0.001,
-      recordTrajectory: true,
+      recordTrajectory: false, // we capture manually in captureTrajectory()
     });
-    appState.trajCount = 0;
-    appState.physics.onStepComplete = onPhysicsStep;
 
     setProgress(100, 'Ready');
     await nextFrame();
@@ -168,56 +171,64 @@ addInhibitorBtn.addEventListener('click', () => {
   }
 });
 
-startBtn.addEventListener('click', () => {
+startBtn.addEventListener('click', async () => {
   if (!appState.physics) {
     showStatus('Load a structure first', 'error');
     return;
   }
+  if (appState.capturing) return;
 
-  // Reset the playback buffer to the current pose, then start recording +
-  // playing back the trajectory as frames are produced.
-  appState.trajCount = 0;
-  if (appState.visualization) {
-    appState.visualization.loadTrajectory([]); // snapshots current positions as baseline
-    appState.visualization.play();
-  }
-
-  appState.physics.start();
-  appState.isRunning = true;
+  appState.capturing = true;
   startBtn.disabled = true;
-  pauseBtn.disabled = false;
-  pauseBtn.textContent = '⏸ Pause';
-  showStatus('Simulation running...', 'success');
+  pauseBtn.disabled = true;
+
+  try {
+    // CAPTURE PHASE: run the whole simulation up front, recording each frame.
+    // This is the compute-heavy part, shown behind the progress bar.
+    const frames = await captureTrajectory();
+
+    // PLAYBACK PHASE: hand the recorded frames to the viewer and play them
+    // back smoothly. No physics runs now, so rendering stays fluid.
+    appState.visualization.loadTrajectory(frames);
+    appState.visualization.play();
+
+    pauseBtn.disabled = false;
+    pauseBtn.textContent = '⏸ Pause';
+    showStatus('Playing recorded trajectory', 'success');
+  } catch (error) {
+    hideLoader();
+    startBtn.disabled = false;
+    showStatus(`✗ Simulation error: ${error.message}`, 'error');
+    console.error('Capture error:', error);
+  } finally {
+    appState.capturing = false;
+  }
 });
 
 pauseBtn.addEventListener('click', () => {
-  if (!appState.physics) return;
+  const viz = appState.visualization;
+  if (!viz) return;
 
-  appState.physics.pause();
-  const paused = appState.physics.isPaused;
-
-  // Keep the playback in sync with the simulation.
-  if (appState.visualization) {
-    if (paused) appState.visualization.pause();
-    else appState.visualization.play();
+  // Pause/resume the recorded PLAYBACK (physics already finished).
+  if (viz.isPlaying) {
+    viz.pause();
+    pauseBtn.textContent = '▶ Resume';
+    showStatus('Paused', 'info');
+  } else {
+    viz.play();
+    pauseBtn.textContent = '⏸ Pause';
+    showStatus('Playing', 'info');
   }
-
-  pauseBtn.textContent = paused ? '▶ Resume' : '⏸ Pause';
-  showStatus(paused ? 'Paused' : 'Resumed', 'info');
 });
 
 resetBtn.addEventListener('click', () => {
-  if (!appState.physics) return;
-
-  appState.physics.stop();
-  appState.physics.reset();
-  appState.isRunning = false;
-  appState.trajCount = 0;
-
-  // Stop playback and restore the structure to its pre-simulation pose.
-  if (appState.visualization) {
-    appState.visualization.resetTrajectory();
+  // Stop playback and restore the structure to its crystal pose.
+  if (appState.visualization) appState.visualization.resetTrajectory?.();
+  if (appState.physics) {
+    appState.physics.stop();
+    appState.physics.reset();
   }
+  appState.isRunning = false;
 
   startBtn.disabled = false;
   pauseBtn.disabled = true;
@@ -342,45 +353,62 @@ exportPdbBtn.addEventListener('click', () => {
 });
 
 // ============================================================================
-// SIMULATION → VIEWER BRIDGE
+// TRAJECTORY CAPTURE (compute up front, then play back smoothly)
 // ============================================================================
 
+// Tunables: total recorded frames and physics steps advanced per frame.
+// More frames = longer/smoother playback but a longer capture.
+const CAPTURE_FRAMES = 200;
+const STEPS_PER_FRAME = 2;
+
 /**
- * Called once per completed physics step. Updates the metric readouts and
- * streams any newly-recorded trajectory frames into the visualization engine
- * so the view plays back the recorded motion.
- *
- * Robust to two physics-engine conventions:
- *  1. onStepComplete is called with the just-recorded frame (fast path).
- *  2. onStepComplete is called with no args → we diff exportTrajectory().
- *
- * If your PhysicsEngine exposes the current frame differently, this is the one
- * place to adjust.
+ * Run the whole simulation synchronously in chunks, recording one snapshot per
+ * frame, and return the trajectory. The chunked `await nextFrame()` keeps the
+ * progress bar animating and the tab responsive during the compute-heavy part.
+ * This is what removes the choppiness: all the physics happens here, before any
+ * playback, instead of competing with rendering frame-by-frame.
  */
-function onPhysicsStep(frame) {
-  updateMetrics();
-  const viz = appState.visualization;
-  if (!viz) return;
+async function captureTrajectory() {
+  const physics = appState.physics;
 
-  // Fast path: the callback handed us the frame directly.
-  if (frame && (Array.isArray(frame) || frame.positions)) {
-    viz.appendTrajectory([frame]);
-    return;
+  // Start every capture from the crystal pose with fresh velocities, so runs
+  // are deterministic and don't drift after repeated Start presses.
+  if (appState.initialPositions) {
+    physics.atoms.forEach((a, i) => {
+      const p = appState.initialPositions[i];
+      if (p) {
+        a.position.x = p.x;
+        a.position.y = p.y;
+        a.position.z = p.z;
+      }
+    });
   }
+  physics.reset();
 
-  // Fallback: pull the recorded trajectory and append only the new frames.
-  try {
-    const raw = appState.physics.exportTrajectory();
-    const arr = Array.isArray(raw)
-      ? raw
-      : (raw && (raw.frames || raw.trajectory || raw.steps)) || [];
-    if (arr.length > appState.trajCount) {
-      viz.appendTrajectory(arr.slice(appState.trajCount));
-      appState.trajCount = arr.length;
+  const snapshot = () => ({
+    positions: physics.atoms.map((a) => ({
+      x: a.position.x, y: a.position.y, z: a.position.z,
+    })),
+  });
+
+  const frames = [snapshot()]; // frame 0 = starting pose
+  showLoader('Simulating…', 0);
+  await nextFrame();
+
+  for (let f = 1; f <= CAPTURE_FRAMES; f++) {
+    for (let s = 0; s < STEPS_PER_FRAME; s++) physics.step();
+    frames.push(snapshot());
+
+    // Yield periodically so the bar paints and the page doesn't freeze.
+    if (f % 4 === 0 || f === CAPTURE_FRAMES) {
+      setProgress((f / CAPTURE_FRAMES) * 100, `Simulating… ${f}/${CAPTURE_FRAMES}`);
+      updateMetrics();
+      await nextFrame();
     }
-  } catch (e) {
-    /* trajectory not available this step — ignore */
   }
+
+  hideLoader();
+  return frames;
 }
 
 // ============================================================================
